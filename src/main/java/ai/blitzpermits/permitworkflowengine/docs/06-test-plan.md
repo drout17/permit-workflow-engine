@@ -1,58 +1,82 @@
-# 06 — Verification & Acceptance Test Plan
+# 06 — Verification & JUnit 5 Integration Test Plan
 
-**Service:** `permit-workflow-engine`  
-**Test Framework:** JUnit 5, Spring Boot Test (`@SpringBootTest`), MockMvc / TestRestTemplate  
-**Database:** H2 (In-Memory with Flyway) & PostgreSQL (Integration)  
-**Status:** Baseline v1.0
-
----
-
-## 1. Test Strategy & Scope
-
-Verification validates four core guarantees of `permit-workflow-engine`:
-1. **Policy Strategy Enforcement:** All combinations of `SubmissionPolicy`, `ApprovalPolicy`, and `ResubmissionPolicy` permit valid transitions (`200 OK`) and block policy violations (`422 Unprocessable Entity`).
-2. **Audit Trail & Mandatory Comments:** Every state transition rejects null/blank comments (`400 Bad Request`) and writes immutable, chronologically ordered `permit_status_history` records.
-3. **Config Version Isolation:** Updating a jurisdiction's active `JurisdictionWorkflowConfig` never alters the rules applied to pre-existing in-flight projects.
-4. **Concurrency Serialization:** Pessimistic row-level locking (`SELECT ... FOR UPDATE`) on the parent `Project` prevents race conditions across concurrent multi-permit transitions.
+**Version:** 1.0 (Baseline)  
+**Target Package:** `src/test/java/ai/blitzpermits/permitworkflowengine/`  
+**Test Stack:** JUnit 5 (Jupiter) · Spring Boot Test (`@SpringBootTest`, `@AutoConfigureMockMvc`) · AssertJ · Flyway + H2 (`MODE=PostgreSQL`)
 
 ---
 
-## 2. Policy Matrix Test Cases
+## 1. Testing Strategy & Environment Isolation
 
-| Test ID | Policy Configuration | Action Sequence | Expected Result |
+To validate end-to-end regulatory enforcement, transactional locking, and schema constraints without mocking away SQL semantics:
+
+* **Full Spring Context + Real Flyway Migrations:** Integration tests boot the full Spring Boot context against an isolated embedded H2 database (`MODE=PostgreSQL`), automatically executing `V1__init_schema.sql` and `V2__seed_jurisdictions.sql` with Hibernate `ddl-auto: validate`.
+* **HTTP Boundary Verification (`MockMvc`):** All workflow scenarios execute through the REST controllers (`JurisdictionController` and `ProjectWorkflowController`) using `MockMvc` to verify JSON serialization, Bean Validation (`@Valid`), HTTP status codes (`200`, `201`, `400`, `404`, `409`, `422`), and RFC 7807 `ProblemDetail` payloads.
+* **Multi-Threaded Concurrency Verification (`ExecutorService` + `CountDownLatch`):** Concurrent race-condition tests intentionally bypass `@Transactional` test rollback on the outer test method so worker threads contend on real committed database rows and `SELECT ... FOR UPDATE` locks.
+
+---
+
+## 2. Acceptance Test Matrix (14 Core Test Cases)
+
+### 2.1 Policy Strategy Enforcement (`TC-POL`)
+
+| Test ID | Policy Matrix | Scenario & Steps | Expected Outcome |
 | :--- | :--- | :--- | :--- |
-| **`TC-POL-01`** | `BUNDLED` + `BOTTOM_UP` + `SYNCHRONIZED` | Call `POST /permits/{id}/submit` on a single `DRAFT` permit. | **`422 Unprocessable Entity`** — Individual submission blocked under `BUNDLED` policy. |
-| **`TC-POL-02`** | `BUNDLED` + `BOTTOM_UP` + `SYNCHRONIZED` | Call `POST /projects/{id}/submit-bundle` → approve `MAIN` while `SUB` is `SUBMITTED`. | Bundle succeeds (`200 OK`, project status `ACTIVE`); `MAIN` approval fails with **`422`** until all `SUB` permits are `APPROVED`. |
-| **`TC-POL-03`** | `BUNDLED` + `BOTTOM_UP` + `SYNCHRONIZED` | Approve all `SUB` permits → approve `MAIN` permit. | **`200 OK`** — `MAIN` reaches `APPROVED`, and parent `Project.status` transitions to `COMPLETED`. |
-| **`TC-POL-04`** | `MAIN_FIRST` + `TOP_DOWN` + `DECOUPLED` | Submit `SUB` permit while `MAIN` is still `DRAFT`. | **`422 Unprocessable Entity`** — `MAIN` must be submitted before `SUB`. |
-| **`TC-POL-05`** | `MAIN_FIRST` + `TOP_DOWN` + `DECOUPLED` | Submit `MAIN` → submit `SUB` → approve `SUB` while `MAIN` is `SUBMITTED`. | Submissions succeed (`200 OK`); `SUB` approval fails with **`422`** until `MAIN` is `APPROVED`. |
-| **`TC-POL-06`** | `INDEPENDENT` + `INDEPENDENT` + `DECOUPLED` | Submit and approve `SUB` and `MAIN` in arbitrary order. | **`200 OK`** — All transitions succeed independently; `Project.status` becomes `COMPLETED` after final permit approval. |
+| **`TC-POL-01`** | `BUNDLED` (Tampa) | Create Tampa project (`NEW_CONSTRUCTION` + `PLUMBING`), then call `POST /permits/{mainId}/submit` individually. | Returns **`422 Unprocessable Entity`** (`WorkflowRuleViolationException`); permit remains `DRAFT`. |
+| **`TC-POL-02`** | `BUNDLED` (Tampa) | Call `POST /projects/{projectId}/submit-bundle` on the Tampa project. | Returns **`200 OK`**; `Project.status` becomes `ACTIVE` and all `DRAFT` permits transition to `SUBMITTED`. |
+| **`TC-POL-03`** | `MAIN_FIRST` (Austin) | Create Austin project (`ELECTRICAL` `MAIN` + `SOLAR` `SUB`). Attempt `POST /permits/{solarId}/submit` while `ELECTRICAL` is still `DRAFT`. | Returns **`422 Unprocessable Entity`**; `SOLAR` remains `DRAFT`. |
+| **`TC-POL-04`** | `MAIN_FIRST` (Austin) | Submit `ELECTRICAL` (`MAIN`) first (`200 OK`), then submit `SOLAR` (`SUB`). | Both calls return **`200 OK`**; both permits reach `SUBMITTED`. |
+| **`TC-POL-05`** | `BOTTOM_UP` (Tampa) | Bundle-submit Tampa project. Attempt `POST /permits/{mainId}/approve` before `PLUMBING` (`SUB`) is approved; then approve `PLUMBING` first, followed by `MAIN`. | Early `MAIN` approval returns **`422`**; approving `PLUMBING` then `MAIN` succeeds (**`200 OK`**) and marks project **`COMPLETED`**. |
+| **`TC-POL-06`** | `TOP_DOWN` (Austin) | Submit Austin `MAIN` + `SUB`. Attempt `POST /permits/{solarId}/approve` before `ELECTRICAL` (`MAIN`) is approved; then approve `ELECTRICAL` first, followed by `SOLAR`. | Early `SUB` approval returns **`422`**; approving `MAIN` then `SUB` succeeds (**`200 OK`**) and marks project **`COMPLETED`**. |
 
----
+### 2.2 Resubmission & Sibling Hold Coupling (`TC-RES`)
 
-## 3. Resubmission & Sibling Hold Test Cases
-
-| Test ID | Policy Mode | Scenario | Expected Result |
+| Test ID | Policy Matrix | Scenario & Steps | Expected Outcome |
 | :--- | :--- | :--- | :--- |
-| **`TC-RES-01`** | `SYNCHRONIZED` | `MAIN` and `SUB` are `SUBMITTED`. Reviewer calls `request-corrections` on `SUB`. | **`200 OK`** — `SUB` moves to `CORRECTIONS_REQUIRED`; `MAIN` automatically transitions to `ON_HOLD_FOR_SIBLINGS` with system audit note. |
-| **`TC-RES-02`** | `SYNCHRONIZED` | Following `TC-RES-01`, applicant calls `resubmit` on `SUB`. | **`200 OK`** — `SUB.resubmissionCycle` increments (`0 → 1`), `SUB` returns to `SUBMITTED`, and `MAIN` is released from `ON_HOLD_FOR_SIBLINGS` back to `SUBMITTED`. |
-| **`TC-RES-03`** | `DECOUPLED` | `MAIN` and `SUB` are `SUBMITTED`. Reviewer calls `request-corrections` on `SUB`. | **`200 OK`** — `SUB` moves to `CORRECTIONS_REQUIRED`; `MAIN` remains `SUBMITTED` and can still be approved independently. |
+| **`TC-RES-01`** | `SYNCHRONIZED` (Tampa) | Bundle-submit Tampa project (`MAIN`, `PLUMBING`, `ELECTRICAL`). Call `POST /permits/{electricalId}/request-corrections`. | Returns **`200 OK`**; `ELECTRICAL` becomes `CORRECTIONS_REQUIRED`; `MAIN` and `PLUMBING` automatically transition to `ON_HOLD_FOR_SIBLINGS`. |
+| **`TC-RES-02`** | `SYNCHRONIZED` (Tampa) | Continuing `TC-RES-01`, attempt `POST /permits/{plumbingId}/approve` while `PLUMBING` is `ON_HOLD_FOR_SIBLINGS`; then call `POST /permits/{electricalId}/resubmit`. | Approval while on hold fails with **`422`**; `/resubmit` returns **`200 OK`**, sets `ELECTRICAL` to `SUBMITTED` with `resubmissionCycle == 1`, and releases `MAIN` and `PLUMBING` back to `SUBMITTED`. |
+| **`TC-RES-03`** | `DECOUPLED` (Austin) | Submit Austin `MAIN` and `SUB`. Call `POST /permits/{solarId}/request-corrections`. | Returns **`200 OK`** with **only** `SOLAR` in `CORRECTIONS_REQUIRED`; `MAIN` stays `SUBMITTED` (never placed on hold) and can be approved immediately. |
 
----
+### 2.3 Immutable Audit Trail & Input Guards (`TC-AUD`)
 
-## 4. Mandatory Comments & Audit Trail Test Cases
-
-| Test ID | Endpoint / Scenario | Input Payload | Expected Result |
+| Test ID | Verification Focus | Scenario & Steps | Expected Outcome |
 | :--- | :--- | :--- | :--- |
-| **`TC-AUD-01`** | Any transition endpoint (`/submit`, `/submit-bundle`, `/approve`, `/request-corrections`, `/resubmit`) | `{"actorId": "...", "comments": ""}` or `null` or `"   "` | **`400 Bad Request`** — Transition rejected; permit status and `permit_status_history` remain unchanged. |
-| **`TC-AUD-02`** | Full lifecycle (`create` → `submit-bundle` → `request-corrections` → `resubmit` → `approve`) | Valid non-blank comments on each step | `GET /permits/{id}/history` returns 5 chronological entries (`createdAt ASC`) with exact `fromStatus`, `toStatus`, `policyApplied`, `actorId`, and trimmed `comments`. |
+| **`TC-AUD-01`** | Mandatory Comments (`400`) | Invoke `submit-bundle`, `submit`, `approve`, `request-corrections`, and `resubmit` with `comments: ""` and `comments: "   "`. | Every request is rejected with **`400 Bad Request`** prior to state mutation or audit insertion. |
+| **`TC-AUD-02`** | Chronological Audit History | Execute full lifecycle (`create -> submit-bundle -> request-corrections -> resubmit -> approve`) and call `GET /permits/{permitId}/history`. | Returns **`200 OK`** with entries ordered `createdAt ASC`, verifying exact `fromStatus`, `toStatus`, `policyApplied`, `actorId`, and trimmed `comments`. |
+
+### 2.4 Configuration Versioning & In-Flight Pinning (`TC-PIN`)
+
+| Test ID | Verification Focus | Scenario & Steps | Expected Outcome |
+| :--- | :--- | :--- | :--- |
+| **`TC-PIN-01`** | Config Pinning Across Versions | Create Project P1 under Tampa `v1` (`BUNDLED` / `BOTTOM_UP` / `SYNCHRONIZED`). Publish Tampa `v2` (`MAIN_FIRST` / `INDEPENDENT` / `DECOUPLED`). Create Project P2. Verify P1 still enforces `v1` (`BUNDLED`) while P2 enforces `v2` (`MAIN_FIRST`). | P1 rejects single-permit `/submit` (**`422`**) and reports `appliedPolicy.versionNumber == 1`; P2 allows single-permit `/submit` (**`200`**) and reports `versionNumber == 2`. |
+
+### 2.5 Concurrency & Database Integrity (`TC-CON` & `TC-DB`)
+
+| Test ID | Verification Focus | Scenario & Steps | Expected Outcome |
+| :--- | :--- | :--- | :--- |
+| **`TC-CON-01`** | Pessimistic Aggregate Locking | Under Tampa (`BOTTOM_UP`), launch two concurrent threads (`CountDownLatch`) on the same project: Thread A calls `approve` on `SUB` (`PLUMBING`) while Thread B simultaneously calls `approve` on `MAIN`. | `PESSIMISTIC_WRITE` lock on `Project` serializes execution cleanly with zero deadlocks or lost updates; `MAIN` approval either fails deterministically (`422` if it runs first) or succeeds (`200` if it runs second). |
+| **`TC-DB-01`** | Schema & Config Invariants | Attempt to publish a jurisdiction config (`POST /jurisdictions/{id}/config`) with zero `MAIN` permits, two `MAIN` permits, or duplicate permit mappings. | Rejected with **`400 Bad Request`**; database uniqueness and check constraints remain intact. |
 
 ---
 
-## 5. Config Pinning & Concurrency Test Cases
+## 3. Recommended Test Class Organization
 
-| Test ID | Scenario | Verification Assertion |
-| :--- | :--- | :--- |
-| **`TC-PIN-01`** | Create `Project A` under Jurisdiction `v1` (`BUNDLED`), then activate `v2` (`INDEPENDENT`) for the same jurisdiction and create `Project B`. | `Project A` still enforces `BUNDLED` (`422` on single submit), while `Project B` allows single permit submission (`200 OK`). |
-| **`TC-CON-01`** | Two threads concurrently invoke `approvePermit(MAIN)` and `requestCorrections(SUB)` on the same `BOTTOM_UP` project using `CountDownLatch` / `ExecutorService`. | Pessimistic lock (`findByIdWithLock`) serializes both transactions: either `SUB` moves to `CORRECTIONS_REQUIRED` first and `MAIN` approval fails with `422`, or `MAIN` completes first. Database never reaches an illegal `MAIN=APPROVED` + `SUB=CORRECTIONS_REQUIRED` state. |
-| **`TC-DB-01`** | Full Flyway migration (`V1` → `V3`) and lifecycle transitions executed against H2 (`DB_CLOSE_DELAY=-1`) and PostgreSQL. | All `CHECK` constraints (`DRAFT`, `SUBMITTED`, `APPROVED`, `CORRECTIONS_REQUIRED`, `ON_HOLD_FOR_SIBLINGS`) pass without SQL state errors. |
+```text
+src/test/java/ai/blitzpermits/permitworkflowengine/
+├── PermitWorkflowEngineApplicationTests.java       # Smoke test: context + Flyway V1/V2 validation
+├── WorkflowPolicyIntegrationTest.java              # TC-POL-01..06, TC-RES-01..03, TC-AUD-01..02
+├── JurisdictionConfigPinningTest.java              # TC-PIN-01, TC-DB-01
+└── ProjectConcurrencyIntegrationTest.java          # TC-CON-01 (multi-threaded locking verification)
+```
+
+---
+
+## 4. Test Execution Commands
+
+```bash
+# Run all unit and integration tests
+mvn test
+
+# Run a single integration test class
+mvn -Dtest=WorkflowPolicyIntegrationTest test
+```
